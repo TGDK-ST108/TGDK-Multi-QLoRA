@@ -17,7 +17,7 @@ This release demonstrates how **BERT** (understanding) and **Mistral** (generati
 ## 🧩 Project Structure
 ```
 ├── qlora.py # Training wrapper with multi-model support
-├── optimizers.py # AdamW + Lion selection logic
+├── Duo.py # AdamW + Lion selection logic
 ├── duo_interface.py # Public Duo arbitration interface (no internals)
 ├── train_config.yaml # Example training configuration
 ├── README.md # You are here
