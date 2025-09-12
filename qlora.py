@@ -1,7 +1,7 @@
 ﻿# qlora.py – TGDK Magic + Duo + MMT + JadeCodewright + Seals + Rituals
-import os, sys, torch, hashlib, json, subprocess, datetime, glob, argparse
+import os, sys, torch, hashlib, json, subprocess, datetime, glob, argparse, lzma, shutil
 import numpy as np
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM,
     TrainingArguments, BitsAndBytesConfig, get_scheduler
@@ -18,15 +18,31 @@ import sqlite3
 from lion_pytorch import Lion
 from scipy.spatial import Delaunay
 import logging
+import torch.nn as nn
+
 
 # External TGDK geometry modules
 from Mahadevi import Mahadevi
 from Maharaga import Maharaga
 from Trinity import Trinity
-from Duo import make_duo_optimizer 
+from Duo import make_duo_optimizer, Duo
 import json
 from device import load_model
 from accelerate import Accelerator
+from peft import get_peft_model
+from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM, TrainerCallback
+
+
+
+# resolve OUT directory from env or default to ./out
+OUT = os.environ.get("OUT", "./out")
+os.makedirs(OUT, exist_ok=True)
+
+
+# Disable mixed precision globally
+accelerator = Accelerator(mixed_precision="no")
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def load_model_config(path="models.config"):
     with open(path, "r") as f:
@@ -39,11 +55,9 @@ def load_model_config(path="models.config"):
 
 model_cfg = load_model_config()
 BASE     = model_cfg["base_model"]
-outdir   = model_cfg["outdir"]
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-os.makedirs(outdir, exist_ok=True)
-model = load_model(BASE, HF_TOKEN, outdir, gpu_idx=0)
+
 
 # ------------------------------------------------------------------
 # CLI Arguments (parsed first so we can fall back if config is missing keys)
@@ -61,6 +75,18 @@ parser.add_argument("--warmup_steps", type=int, default=0)
 parser.add_argument("--epochs", type=int, default=6)
 parser.add_argument("--use-mmt", action="store_true")
 parser.add_argument("--use-jade", action="store_true")
+parser.add_argument(
+    "--duo-mode",
+    type=str,
+    default="hybrid",
+    choices=["symbolic", "amp", "hybrid"],
+    help="Which Duo optimizer mode to use"
+)
+parser.add_argument("--plateau-patience", type=int, default=200,
+                    help="Steps to wait before triggering escape mechanisms")
+parser.add_argument("--plateau-delta", type=float, default=1e-3,
+                    help="Minimum loss improvement threshold to reset patience")
+
 cli_args, _ = parser.parse_known_args()
 
 # ------------------------------------------------------------------
@@ -73,9 +99,37 @@ epochs    = model_cfg.get("epochs")    or cli_args.epochs
 opt_choice = model_cfg.get("optimizer") or cli_args.optimizer
 use_mmt   = model_cfg.get("mmt")       or cli_args.use_mmt
 use_jade  = model_cfg.get("jade")      or cli_args.use_jade
+outdir   = os.path.join(OUT, "olivia-12ob-dapt-lora")
+offload_dir = os.path.join(outdir, "offload")
 
+
+PRIVATE_KEY_PATH = os.environ.get("TGDK_PRIVATE_KEY", "tgdk_private.pem")
+PUBLIC_KEY_PATH  = os.environ.get("TGDK_PUBLIC_KEY", "tgdk_public.pem")
+model = load_model(BASE, HF_TOKEN, outdir, gpu_idx=0)
 OUT = os.environ.get("OUT", ".")
 
+use_cuda = torch.cuda.is_available()
+supports_bf16 = use_cuda and torch.cuda.is_bf16_supported()
+
+fp16_flag = use_cuda and not supports_bf16
+bf16_flag = supports_bf16
+
+model_cfg = load_model_config()
+HF_TOKEN = os.environ.get("HF_TOKEN")
+
+
+
+
+if torch.cuda.is_available():
+    if torch.cuda.is_bf16_supported():
+        fp16_flag = False
+        bf16_flag = True
+    else:
+        fp16_flag = True
+        bf16_flag = False
+else:
+    fp16_flag = False
+    bf16_flag = False
 
 
 
@@ -89,17 +143,87 @@ except ImportError:
         from compat_dummy import DummyOptim, DummyScheduler
 
 
-# Load model + tokenizer
-tokenizer = AutoTokenizer.from_pretrained(BASE, token=HF_TOKEN)
-offload_dir = os.path.join(outdir, "offload")
-os.makedirs(offload_dir, exist_ok=True)
-
 bnb_cfg = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_use_double_quant=True,
     bnb_4bit_quant_type="nf4",
     bnb_4bit_compute_dtype=torch.float16,
 )
+
+def olivia_pipeline(text):
+    # Step 1: BERT encodes the text
+    bert_inputs = bert_tok(text, return_tensors="pt")
+    bert_outputs = bert_model(**bert_inputs).last_hidden_state
+
+    # Maybe take [CLS] embedding
+    cls_embedding = bert_outputs[:, 0, :]
+
+    # Step 2: Feed CLS embedding into Mistral prompt
+    prompt = f"[BERT-CLS: {cls_embedding.tolist()}]\n{text}\nResponse:"
+    mistral_inputs = mistral_tok(prompt, return_tensors="pt")
+    gen = mistral_model.generate(**mistral_inputs, max_new_tokens=100)
+
+    return mistral_tok.decode(gen[0], skip_special_tokens=True)
+
+class PlateauEscapeCallback(TrainerCallback):
+    def __init__(self, trainer, patience, min_delta):
+        self.trainer = trainer
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = float("inf")
+        self.bad_steps = 0
+        self.jade_triggered = False
+        self.cosine_triggered = False
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None or "loss" not in logs:
+            return
+        loss = logs["loss"]
+
+        if loss + self.min_delta < self.best_loss:
+            self.best_loss = loss
+            self.bad_steps = 0
+        else:
+            self.bad_steps += 1
+
+        if self.bad_steps >= self.patience:
+            if not self.cosine_triggered:
+                from transformers import get_scheduler
+                new_sched = get_scheduler(
+                    "cosine",
+                    optimizer=self.trainer.optimizer,
+                    num_warmup_steps=args.warmup_steps,
+                    num_training_steps=state.max_steps
+                )
+                self.trainer.lr_scheduler = new_sched
+                print(f"⚡ [PlateauEscape] Switched LR scheduler → cosine (patience={self.patience})")
+                self.cosine_triggered = True
+
+            if hasattr(self.trainer, "jade_lex") and not self.jade_triggered:
+                self.trainer.use_jade_reweighting = True
+                print(f"⚡ [PlateauEscape] Jade reweighting enabled (min_delta={self.min_delta})")
+                self.jade_triggered = True
+
+            self.bad_steps = 0
+
+
+class BertMistralFusion(nn.Module):
+    def __init__(self, bert, mistral):
+        super().__init__()
+        self.bert = bert
+        self.mistral = mistral
+        self.proj = nn.Linear(
+            bert.config.hidden_size + mistral.config.hidden_size,
+            mistral.config.hidden_size
+        )
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        bert_out = self.bert(input_ids, attention_mask=attention_mask).last_hidden_state[:,0,:]
+        mistral_out = self.mistral.model(input_ids, attention_mask=attention_mask).last_hidden_state
+        fused = torch.cat([bert_out.unsqueeze(1).expand(-1, mistral_out.size(1), -1), mistral_out], dim=-1)
+        fused = self.proj(fused)
+        return self.mistral(inputs_embeds=fused, labels=labels)
+
 
 class TGDKMemoryDB:
     def __init__(self, db_path="tgdk_memory.db"):
@@ -129,7 +253,8 @@ class TGDKMemoryDB:
         INSERT INTO memory (epoch, step, loss, eval_loss, pillar, sliver, matrix, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (epoch, step, loss, eval_loss, pillar, sliver,
-              matrix.tobytes(), datetime.datetime.utcnow().isoformat()))
+              matrix.tobytes(), datetime.datetime.now(datetime.timezone.utc).isoformat()))
+
         self.conn.commit()
 
     def recall(self, limit=5, query=None):
@@ -138,6 +263,66 @@ class TGDKMemoryDB:
             query = f"SELECT * FROM memory ORDER BY id DESC LIMIT {limit}"
         cur.execute(query)
         return cur.fetchall()
+
+class PlateauEscapeCallback(TrainerCallback):
+    def __init__(self, trainer, patience=200, min_delta=1e-3):
+        self.trainer = trainer
+        self.patience = patience       # steps to wait before escape
+        self.min_delta = min_delta     # minimum improvement in loss
+        self.best_loss = float("inf")
+        self.bad_steps = 0
+        self.jade_triggered = False
+        self.cosine_triggered = False
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None or "loss" not in logs:
+            return
+        loss = logs["loss"]
+
+        if loss + self.min_delta < self.best_loss:
+            self.best_loss = loss
+            self.bad_steps = 0
+        else:
+            self.bad_steps += 1
+
+        if self.bad_steps >= self.patience:
+            # Switch LR scheduler to cosine if not already
+            if not self.cosine_triggered:
+                from transformers import get_scheduler
+                new_sched = get_scheduler(
+                    "cosine",
+                    optimizer=self.trainer.optimizer,
+                    num_warmup_steps=args.warmup_steps,
+                    num_training_steps=state.max_steps
+                )
+                self.trainer.lr_scheduler = new_sched
+                print("⚡ [PlateauEscape] Switched LR scheduler to cosine")
+                self.cosine_triggered = True
+
+            # Apply Jade reweighting dynamically
+            if hasattr(self.trainer, "jade_lex") and not self.jade_triggered:
+                self.trainer.use_jade_reweighting = True
+                print("⚡ [PlateauEscape] Jade reweighting enabled")
+                self.jade_triggered = True
+
+            # Reset counter so it doesn’t trigger every log
+            self.bad_steps = 0
+
+
+bert_tok = AutoTokenizer.from_pretrained("bert-base-uncased")
+bert_model = AutoModel.from_pretrained("bert-base-uncased")
+
+mistral_tok = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+mistral_model = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-v0.1")
+
+def run_pipeline(input_text: str, task: str = "generation"):
+    if task in ("classification", "embedding"):
+        return bert_model(**bert_tok(input_text, return_tensors="pt"))
+    else:
+        return mistral_model.generate(
+            **mistral_tok(input_text, return_tensors="pt"),
+            max_new_tokens=100
+        )
 
 
 class MMTController:
@@ -207,27 +392,80 @@ class MMTController:
         return {"volumetric": v, "pyramid": p, "figure8": f}
 
 
-# Instantiate
-mmt_controller = MMTController(dim=256)
+# ------------------------------------------------------------------
+# Initialize MMT + Jade systems
+# ------------------------------------------------------------------
+if cli_args.use_mmt:
+    # --- Initialize Mahadevi (vector field) ---
+    mahadevi = Mahadevi()
+    mahadevi.set_vector_field([np.array([1, 0]), np.array([0, 1])])  # orthogonal seed vectors
+    print("Vector field set successfully.")
 
-# Attach to Duo optimizer
-duo_optim, duo_sched = make_duo_optimizer(model, mmt_controller)
+    # --- Initialize Maharaga (centroid data) ---
+    maharaga = Maharaga()
+    maharaga.add_data_point([0.5, 0.5])  # starter centroid
+    print("Data point [0.5, 0.5] added.")
+
+    # --- Initialize Trinity (AQVP balance) ---
+    trinity = Trinity(0.8, 1.2, 0.95)
+
+    # --- Build MMT Controller with all three ---
+    mmt_controller = MMTController(
+        dim=1440,
+        mahadevi=mahadevi,
+        maharaga=maharaga,
+        trinity=trinity
+    )
+    print("[MMT] Mahadevi/Maharaga/Trinity initialized and bound")
+
+else:
+    mmt_controller = None
 
 
+
+# --------- Build optimizer (with mode from CLI) ---------
+#duo_optim, duo_sched = make_duo_optimizer(
+#   model,
+#    mmt_controller=mmt_controller,
+#    lr=cli_args.learning_rate,
+#    weight_decay=cli_args.weight_decay,
+#    mode=cli_args.duo_mode  # 👈 symbolic | amp | hybrid
+#)
+#use_optimizers = (duo_optim, duo_sched)
 
 # ------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------
-HF_TOKEN = os.environ.get("HF_TOKEN")
 WORK     = os.environ.get("WORK", ".")
-trainp   = os.path.join(WORK, "packs", "train.jsonl")
-valp     = os.path.join(WORK, "packs", "val.jsonl")
-outdir   = os.path.join(OUT, "olivia-12ob-dapt-lora")
-offload_dir = os.path.join(outdir, "offload")
+# Collect training files
+train_files = sorted(glob.glob(os.path.join(WORK, "packs", "train*.jsonl")))
+val_files   = sorted(glob.glob(os.path.join(WORK, "packs", "val*.jsonl")))
 
+# ---- Training set ----
+if train_files:
+    print(f"[INFO] Found training files: {train_files}")
+    raw_train = load_dataset(
+        "json",
+        data_files={"train": train_files},
+        split="train"
+    )
+else:
+    raise FileNotFoundError("No train*.jsonl files found under packs/")
+print(raw_train[0])
 
-PRIVATE_KEY_PATH = os.environ.get("TGDK_PRIVATE_KEY", "tgdk_private.pem")
-PUBLIC_KEY_PATH  = os.environ.get("TGDK_PUBLIC_KEY", "tgdk_public.pem")
+# ---- Validation set ----
+if val_files:
+    print(f"[INFO] Found validation files: {val_files}")
+    raw_val = load_dataset(
+        "json",
+        data_files={"validation": val_files},
+        split="validation"
+    )
+else:
+    # fallback: take slice of training
+    raw_val = raw_train.select(range(min(20, len(raw_train))))
+    print("[WARN] No val*.jsonl found — using slice of train")
+
 
 try:
     from accelerate.utils import DummyOptim
@@ -270,75 +508,6 @@ def ensure_keys(priv_path, pub_path):
 
 ensure_keys(PRIVATE_KEY_PATH, PUBLIC_KEY_PATH)
 
-# ------------------------------------------------------------------
-# Duo Optimizer
-# ------------------------------------------------------------------
-class Duo(torch.optim.Optimizer):
-    def __init__(self, params, lr=1e-4, weight_decay=0.01,
-                 mahadevi=None, maharaga=None, trinity=None):
-        self.adamw = AdamW(params, lr=lr, weight_decay=weight_decay)
-        self.lion = Lion(params, lr=lr, weight_decay=weight_decay)
-        self.mahadevi = mahadevi
-        self.maharaga = maharaga
-        self.trinity = trinity
-        self.state = {}
-
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        # Capture param snapshots
-        adamw_before = {id(p): p.clone().detach()
-                        for g in self.adamw.param_groups
-                        for p in g['params'] if p.grad is not None}
-        self.adamw.step()
-        adamw_update = {pid: (p.detach() - adamw_before[pid])
-                        for g in self.adamw.param_groups
-                        for p in g['params'] if p.grad is not None
-                        for pid in [id(p)]}
-
-        lion_before = {id(p): p.clone().detach()
-                       for g in self.lion.param_groups
-                       for p in g['params'] if p.grad is not None}
-        self.lion.step()
-        lion_update = {pid: (p.detach() - lion_before[pid])
-                       for g in self.lion.param_groups
-                       for p in g['params'] if p.grad is not None
-                       for pid in [id(p)]}
-
-        alpha = self.compute_balance_factor()
-
-        # Interweave updates
-        for g in self.adamw.param_groups:
-            for p in g['params']:
-                if p.grad is None: continue
-                pid = id(p)
-                blended = alpha * adamw_update[pid] + (1 - alpha) * lion_update[pid]
-                p.data = lion_before[pid] + blended
-        return loss
-
-    def compute_balance_factor(self, epoch=None, loss=None):
-        alpha = 0.5
-        if self.mahadevi and self.maharaga and self.trinity:
-            try:
-                v1 = np.array(self.mahadevi.vector_field[0])
-                v2 = np.array(self.mahadevi.vector_field[1])
-                angle = self.mahadevi.angle_between_vectors(v1, v2) / 180.0
-                centroid = (np.mean(self.maharaga.data_points, axis=0)
-                            if self.maharaga.data_points else np.array([0.5]))
-                centroid_norm = np.linalg.norm(centroid) % 1.0
-                trinity_seq = np.mean(self.trinity.expand_data(np.random.rand(5)))
-                alpha = float((angle + centroid_norm + trinity_seq) / 3.0)
-                if epoch is not None:
-                    alpha *= (1 - epoch * 0.05)
-                if loss is not None:
-                    alpha *= (1.0 / (1.0 + loss))
-                return max(0.0, min(1.0, alpha))
-            except Exception:
-                return 0.5
-        return alpha
 
 class TGDKFoldExpansion:
     def __init__(self, r=16, alpha=32, dropout=0.05, targets=None):
@@ -426,7 +595,8 @@ class TGDKMemoryDB:
         INSERT INTO memory (epoch, step, loss, eval_loss, pillar, sliver, matrix, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (epoch, step, loss, eval_loss, pillar, sliver,
-              matrix.tobytes(), datetime.datetime.utcnow().isoformat()))
+              matrix.tobytes(), datetime.datetime.now(datetime.timezone.utc).isoformat()))
+
         self.conn.commit()
 
     def recall(self, query="SELECT * FROM memory ORDER BY id DESC LIMIT 5"):
@@ -443,26 +613,39 @@ if tok.pad_token_id is None:
     tok.pad_token_id = tok.eos_token_id
 tok.padding_side = "right"
 
-# Load datasets
-raw_train = load_dataset("json", data_files=trainp, split="train")
+def fmt(example):
+    instruction = example.get("instruction", "")
+    input_text  = example.get("input", "")
+    output_text = example.get("output", "")
 
-# If you have a validation JSONL, load it here
-if os.path.exists(valp):
-    raw_val = load_dataset("json", data_files=valp, split="train")
-else:
-    # fallback: take a slice of train as validation
-    raw_val = raw_train.select(range(min(100, len(raw_train))))
-    print("[WARN] val.jsonl not found — using small slice of train as validation set")
+    if input_text:
+        prompt = f"{instruction}\n\nInput:\n{input_text}\n\nResponse:"
+    else:
+        prompt = f"{instruction}\n\nResponse:"
 
-def fmt(ex): return {"text": ex["text"]}
-ds_train = raw_train.filter(lambda ex: isinstance(ex.get("text", ""), str) and len(ex["text"]) > 0).map(fmt)
-ds_val   = raw_val.filter(lambda ex: isinstance(ex.get("text", ""), str) and len(ex["text"]) > 0).map(fmt)
+    # Build the full sequence
+    text = (prompt.strip() + " " + output_text).strip()
+
+    return {
+        "text": text,
+        # Tokenizer will convert these into input_ids and labels
+        "labels": text
+    }
+
+
+
+
+# Build text column first
+ds_train = raw_train.map(fmt, remove_columns=raw_train.column_names)
+ds_val   = raw_val.map(fmt, remove_columns=raw_val.column_names)
+ds_train = ds_train.filter(lambda ex: len(ex["text"].strip()) > 0)
+ds_val   = ds_val.filter(lambda ex: len(ex["text"].strip()) > 0)
 
 memory_db = TGDKMemoryDB(os.path.join(outdir, "tgdk_memory.db"))
 
 # Try recalling
 try:
-    recalls = memory_db.recall("SELECT * FROM memory ORDER BY id DESC LIMIT 3")
+    recalls = memory_db.recall("SELECT * FROM memory ORDER BY id DESC LIMIT 144")
     if recalls:
         print(f"[TGDK-MEMORY] Warming start with {len(recalls)} fold matrices")
         warm_matrix = np.mean(
@@ -498,24 +681,27 @@ fp16 = torch.cuda.is_available() and not bf16
 
 train_args = TrainingArguments(
     output_dir=outdir,
-    per_device_train_batch_size=1,
-    per_device_eval_batch_size=1,
-    gradient_accumulation_steps=1,
+    per_device_train_batch_size=4,     # scale with your GPU VRAM
+    per_device_eval_batch_size=4,
+    gradient_accumulation_steps=8,     # effective batch = 32
     learning_rate=cli_args.learning_rate,
-    num_train_epochs=cli_args.epochs,
-    fp16=False,              # ensure disabled
-    bf16=False,              # ensure disabled
+    num_train_epochs=cli_args.epochs,  # e.g. 3–5
+    fp16=False,
+    bf16=False,
     fp16_full_eval=False,
     bf16_full_eval=False,
-    logging_steps=1,
+    logging_steps=25,
     max_grad_norm=1.0,
     eval_strategy="steps",
-    eval_steps=1,
-    save_steps=10,
-    save_total_limit=1,
-    dataloader_num_workers=0,
-    report_to="none",
+    eval_steps=250,
+    save_strategy="steps",
+    save_steps=250,
+    save_total_limit=5,                # keep 5 checkpoints
+    dataloader_num_workers=2,
+    report_to=["tensorboard"],         # or ["wandb"] if you use wandb
+    warmup_ratio=0.03,                 # ~3% of steps for warmup
 )
+
 
 
 # ------------------------------------------------------------------
@@ -530,7 +716,13 @@ if cli_args.use_mmt:
 
     trinity = Trinity(0.8, 1.2, 0.95)  # balanced initial AQVP
 
-    mmt_controller = MMTController(mahadevi, maharaga, trinity)
+    mmt_controller = MMTController(
+        dim=256,
+        mahadevi=mahadevi,
+        maharaga=maharaga,
+        trinity=trinity
+    )
+
     print("[MMT] Mahadevi/Maharaga/Trinity initialized and bound")
 else:
     mmt_controller = None
@@ -552,20 +744,59 @@ else:
 # ------------------------------------------------------------------
 def make_optimizer_scheduler(model, cli_args, total_steps):
     if cli_args.optimizer == "adamw":
-        optimizer = AdamW(model.parameters(), lr=cli_args.learning_rate, weight_decay=cli_args.weight_decay)
+        optimizer = AdamW(
+            model.parameters(),
+            lr=cli_args.learning_rate,
+            weight_decay=cli_args.weight_decay
+        )
+
     elif cli_args.optimizer == "lion":
-        optimizer = Lion(model.parameters(), lr=cli_args.learning_rate, weight_decay=cli_args.weight_decay)
+        optimizer = Lion(
+            model.parameters(),
+            lr=cli_args.learning_rate,
+            weight_decay=cli_args.weight_decay
+        )
+
     elif cli_args.optimizer == "adafactor":
         from transformers import Adafactor
-        optimizer = Adafactor(model.parameters(), scale_parameter=True, relative_step=True, warmup_init=True, lr=None)
+        optimizer = Adafactor(
+            model.parameters(),
+            scale_parameter=True,
+            relative_step=True,
+            warmup_init=True,
+            lr=None
+        )
+
     elif cli_args.optimizer == "duo":
+        # --- Initialize TGDK vector systems ---
         mahadevi = Mahadevi()
-        mahadevi.set_vector_field([np.array([1,0]), np.array([0,1])])
+        mahadevi.set_vector_field([np.array([1, 0]), np.array([0, 1])])
+
         maharaga = Maharaga()
         maharaga.add_data_point([0.5, 0.5])
+
         trinity = Trinity(0.8, 1.2, 0.95)
-        optimizer = Duo(model.parameters(), lr=cli_args.learning_rate, weight_decay=cli_args.weight_decay,
-                        mahadevi=mahadevi, maharaga=maharaga, trinity=trinity)
+
+        # --- collect only trainable params (LoRA adapters, unfrozen layers, etc.) ---
+        trainable_params = [p for n, p in model.named_parameters() if p.requires_grad]
+        if not trainable_params:
+            logging.warning("[Duo] No trainable parameters found — inserting dummy param")
+            trainable_params = [torch.nn.Parameter(torch.zeros(1, requires_grad=True))]
+        else:
+            logging.info(f"[Duo] Found {len(trainable_params)} trainable params.")
+            for n, p in model.named_parameters():
+                if p.requires_grad:
+                    logging.debug(f"[Duo] Trainable → {n}: {tuple(p.shape)}")
+
+        optimizer = Duo(
+            trainable_params,
+            lr=cli_args.learning_rate,
+            weight_decay=cli_args.weight_decay,
+            mahadevi=mahadevi,
+            maharaga=maharaga,
+            trinity=trinity
+        )
+
     else:
         raise ValueError(f"Unknown optimizer {cli_args.optimizer}")
 
@@ -577,14 +808,20 @@ def make_optimizer_scheduler(model, cli_args, total_steps):
     )
     return optimizer, scheduler
 
+
 total_steps = len(ds_train) * cli_args.epochs
 optimizers = make_optimizer_scheduler(model, cli_args, total_steps)
 
+peft_cfg = LoraConfig(
+    r=16, lora_alpha=32, lora_dropout=0.05,
+    target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
+    bias="none", task_type="CAUSAL_LM"
+)
 
-# --------- Build optimizer (choose one path) ---------
-# A) Duo optimizer from Duo.py
-duo_optim, duo_sched = make_duo_optimizer(model, mmt_controller)
-use_optimizers = (duo_optim, duo_sched)
+
+# Wrap base model with LoRA adapters before optimizer creation
+model = get_peft_model(model, peft_cfg)
+
 
 # If you prefer standard optimizers instead, comment the two lines above and use:
 # total_steps = len(ds_train) * cli_args.epochs
@@ -592,31 +829,30 @@ use_optimizers = (duo_optim, duo_sched)
 
 sft_config = SFTConfig(
     output_dir=outdir,
-    overwrite_output_dir=True,         # overwrite previous runs
-    per_device_train_batch_size=1,
-    per_device_eval_batch_size=1,
-    gradient_accumulation_steps=1,     # scale if you want effective larger batch
+    overwrite_output_dir=True,
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    gradient_accumulation_steps=8,
     learning_rate=cli_args.learning_rate,
     num_train_epochs=cli_args.epochs,
-    warmup_steps=cli_args.warmup_steps,
+    warmup_ratio=0.1,                # better than fixed warmup_steps
     weight_decay=cli_args.weight_decay,
-    logging_steps=10,
-    eval_strategy="steps",             # replaces deprecated evaluation_strategy
-    eval_steps=50,                     # eval every N steps
-    save_strategy="steps",             # save on step boundaries
-    save_steps=200,
-    save_total_limit=2,                # keep last 2 checkpoints
+    logging_steps=25,
+    eval_strategy="steps",     # ✅ correct arg
+    eval_steps=250,
+    save_strategy="steps",
+    save_steps=250,
+    save_total_limit=5,
     dataloader_num_workers=2,
-    report_to="none",                  # disable wandb/hf tracking
-    max_seq_length=4096,               # moved here (valid in SFTConfig)
-    dataset_text_field="text",         # moved here (valid in SFTConfig)
+    report_to=["tensorboard"],
+    max_seq_length=2048,
+    dataset_text_field="text",       # ✅ here only
     packing=False,
-    fp16=False,                        # we forced off AMP earlier
-    bf16=False,
-    max_grad_norm=1.0,                 # ✨ stabilizes Duo spikes
-    lr_scheduler_type=cli_args.scheduler_type,  # linear/cosine/polynomial
-    optim="adamw_torch",               # fallback if Duo is disabled
+    max_grad_norm=1.0,
+    lr_scheduler_type=cli_args.scheduler_type,
+    optim="adamw_torch",             # fallback
 )
+
 
 # --------- Build SFTTrainer (no Accelerate wrappers, no AMP) ---------
 trainer = SFTTrainer(
@@ -625,20 +861,39 @@ trainer = SFTTrainer(
     peft_config=peft_cfg,
     train_dataset=ds_train,
     eval_dataset=ds_val,
-    args=train_args,          # fp16=False, bf16=False here
+    args=train_args,              # contains batch size, lr, steps, etc.
+    dataset_text_field="text",    # ✅ expect pre-mapped "text"
     packing=False,
-    optimizers=use_optimizers # <- pass optimizers directly
+    optimizers=optimizers
 )
+trainer.jade_lex = jade_lex if cli_args.use_jade else None
+trainer.use_jade_reweighting = False
+
+trainer.add_callback(
+    PlateauEscapeCallback(trainer,
+                          patience=cli_args.plateau_patience,
+                          min_delta=cli_args.plateau_delta)
+)
+
 
 # --------- Train once ---------
 train_output = trainer.train()
 
+current_epoch = int(trainer.state.epoch) if trainer.state.epoch is not None else 0
+current_step  = int(trainer.state.global_step) if trainer.state.global_step is not None else 0
 
-
-
+memory_db.save_entry(
+    epoch=current_epoch,
+    step=current_step,
+    loss=last.get("loss", 0.0),
+    eval_loss=last.get("eval_loss", 0.0),
+    pillar=pillar_sig,
+    matrix=matrix,
+    sliver=sliver
+)
 
 try:
-    recalls = memory_db.recall("SELECT * FROM memory ORDER BY id DESC LIMIT 3")
+    recalls = memory_db.recall("SELECT * FROM memory ORDER BY id DESC LIMIT 10")
     if recalls:
         print(f"[TGDK-MEMORY] Warm-started with {len(recalls)} past fold entries")
 except Exception as e:
@@ -649,7 +904,8 @@ except Exception as e:
 # ------------------------------------------------------------------
 def tgdk_log_metrics(step, loss, eval_loss=None, extra=None):
     entry = {
-        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+
         "step": int(step),
         "loss": float(loss) if loss else None,
         "eval_loss": float(eval_loss) if eval_loss else None,
@@ -694,6 +950,8 @@ def hexidex(seal_sig, loss):
     return int(seal_sig, 16) % 997 ^ int(loss * 1e6)
 
 def compute_trideotaxis_metrics(loss):
+    safe = str(loss) if loss is not None else ""
+    encoded = safe.encode("utf-8")
     s_scalar = (1.0 / (1.0 + loss))
     trideo = s_scalar * 3.14159
     quaitrideo = trideo ** 0.5
@@ -709,19 +967,43 @@ def compute_rigpa_hum(loss):
     emptiness = 1.0 / (1.0 + loss)
     return {"TGDK::Rigpa": {"seed": "HUM", "definition": "that which is empty and powerful", "rigpa_scalar": emptiness}}
 
+
 def tgdk_seal_packet(outdir, pillar_sig, last_metrics):
     clauses = sorted(glob.glob(os.path.join(outdir, "*.clause")))
-    seal = {"timestamp": datetime.datetime.utcnow().isoformat(), "pillar": pillar_sig,
-            "last_metrics": last_metrics, "clauses": [os.path.basename(c) for c in clauses], "culmex": "sealed"}
-    seal_path = os.path.join(outdir, "tgdk_seal.json")
-    with open(seal_path, "w") as f: json.dump(seal, f, indent=2)
 
+    seal = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "pillar": pillar_sig,
+        "last_metrics": last_metrics,
+        "clauses": [os.path.basename(c) for c in clauses],
+        "culmex": "sealed"
+    }
+
+    seal_path = os.path.join(outdir, "tgdk_seal.json")
+    with open(seal_path, "w") as f:
+        json.dump(seal, f, indent=2)
+
+    # Sign the seal packet
     with open(PRIVATE_KEY_PATH, "rb") as key_file:
-        private_key = serialization.load_pem_private_key(key_file.read(), password=None, backend=default_backend())
-    with open(seal_path, "rb") as f: data = f.read()
-    signature = private_key.sign(data, padding.PKCS1v15(), hashes.SHA256())
+        private_key = serialization.load_pem_private_key(
+            key_file.read(),
+            password=None,
+            backend=default_backend()
+        )
+
+    with open(seal_path, "rb") as f:
+        data = f.read()
+
+    signature = private_key.sign(
+        data,
+        padding.PKCS1v15(),
+        hashes.SHA256()
+    )
+
     sig_path = os.path.join(outdir, "tgdk_seal.sig")
-    with open(sig_path, "wb") as f: f.write(signature)
+    with open(sig_path, "wb") as f:
+        f.write(signature)
+
     print(f"TGDK::Seal packet signed → {sig_path}")
     return seal_path, sig_path
 
@@ -747,18 +1029,24 @@ def build_charted_matrix(metrics):
 
 
 def ouija_sliver(matrix, pillar_sig):
-    # Hash + fold + base64 = "slivered" imprint
+    if not pillar_sig:
+        pillar_sig = ""  # fallback empty string
     h = hashlib.sha256(matrix.tobytes() + pillar_sig.encode()).hexdigest()
-    sliver = base64.urlsafe_b64encode(h.encode()).decode()[:64]  # short sliver code
+    sliver = base64.urlsafe_b64encode(h.encode()).decode()[:64]
     return sliver
+import os, lzma, shutil
 
+def save_slivered_checkpoint(outdir: str, adapter_path: str, sliver: str) -> str | None:
+    if not os.path.exists(adapter_path):
+        print(f"[WARN] Adapter file not found: {adapter_path}")
+        return None
 
-def save_slivered_checkpoint(outdir, adapter, sliver):
     chkpt_path = os.path.join(outdir, f"checkpoint_{sliver}.xz")
-    with lzma.open(chkpt_path, "wb") as f:
-        f.write(open(adapter, "rb").read())
+    with open(adapter_path, "rb") as src, lzma.open(chkpt_path, "wb", preset=6) as dst:
+        shutil.copyfileobj(src, dst, length=1024*1024)
     print(f"[TGDK] Slivered checkpoint saved → {chkpt_path}")
     return chkpt_path
+
 
 def build_vectorized_planar(metrics):
     # Map metrics into 2D "GIS" vectors
@@ -809,6 +1097,46 @@ def save_geometry(memory_db, epoch, step, pillar, metrics):
     print(f"[TGDK-GIS] Epoch {epoch} geometry traced with {len(simplices)} tris / {len(quads)} quads")
     return entry
 
+def next_outdir(base_name="olivia"):
+    # Look for existing olivia-v1, olivia-v2, ...
+    i = 1
+    while True:
+        candidate = f"{base_name}-v{i}"
+        if not os.path.exists(candidate):
+            return candidate
+        i += 1
+
+os.makedirs(outdir, exist_ok=True)
+print(f"[INFO] Output dir set → {outdir}")
+
+MODELS_CONFIG = "models.config"
+
+# --- Output directory versioning (define this early!) ---
+MODELS_CONFIG = "models.config"
+
+def next_model_version(base_name="olivia") -> tuple[str, int]:
+    models = {}
+    if os.path.exists(MODELS_CONFIG):
+        with open(MODELS_CONFIG, "r") as f:
+            try:
+                models = json.load(f)
+            except json.JSONDecodeError:
+                print("[WARN] models.config is not valid JSON, starting fresh.")
+
+    max_v = 0
+    for key in models.keys():
+        if key.startswith(base_name + "-v"):
+            try:
+                vnum = int(key.split("-v")[-1])
+                max_v = max(max_v, vnum)
+            except ValueError:
+                continue
+
+    version = max_v + 1
+    out_dir = f"./{base_name}-v{version}"
+    return out_dir, version
+
+
 # --------- Post-process once ---------
 last = trainer.state.log_history[-1] if trainer.state.log_history else {}
 
@@ -833,11 +1161,7 @@ if cli_args.use_jade:
 geom_entry = save_geometry(memory_db, epoch=0, step=0, pillar=pillar_sig, metrics=metrics)
 matrix = build_charted_matrix(metrics)
 sliver = ouija_sliver(matrix, pillar_sig)
-memory_db.save_entry(
-    epoch=0, step=0,
-    loss=metrics["loss"], eval_loss=metrics["eval_loss"],
-    pillar=pillar_sig, matrix=matrix, sliver=sliver
-)
+
 
 trainer.save_model(outdir)
 tok.save_pretrained(outdir)
@@ -847,4 +1171,58 @@ olivia_clause_echo(0, outdir)
 seal_path, sig_path = tgdk_seal_packet(outdir, pillar_sig, metrics)
 tgdk_verify_seal(seal_path, sig_path, PUBLIC_KEY_PATH)
 tgdk_vault_sync(outdir)
+# versioning
+out_dir, version = next_model_version("olivia")
+print(f"[INFO] Using output dir → {out_dir}")
 
+# run training with output_dir=out_dir ...
+
+# ensure LoRA adapter is written to top level
+trainer.save_model(out_dir)
+
+def update_models_config(model_name, path):
+    if os.path.exists(MODELS_CONFIG):
+        with open(MODELS_CONFIG, "r") as f:
+            try:
+                models = json.load(f)
+            except json.JSONDecodeError:
+                models = {}
+    else:
+        models = {}
+
+    models[model_name] = {"path": path}
+
+    with open(MODELS_CONFIG, "w") as f:
+        json.dump(models, f, indent=2)
+    print(f"[INFO] models.config updated with {model_name} → {path}")
+
+# --------- Build optimizer (choose one path) ---------
+# A) Duo optimizer from Duo.py
+print("Model:", type(model))
+print("Params count:", sum(p.numel() for p in model.parameters()))
+print("Trainable params count:", sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+duo_optim, duo_sched = make_duo_optimizer(model, mmt_controller)
+use_optimizers = (duo_optim, duo_sched)
+if hasattr(duo_optim, "ghost_gate"):
+    trainer.add_callback(GhostGateCallback(duo_optim.ghost_gate))
+
+
+if getattr(trainer, "use_jade_reweighting", False) and trainer.jade_lex:
+    jade = trainer.jade_lex.bind_metrics(metrics)
+    metrics["loss"] = JadeCodewrightLexicon.jade_loss_reweight(metrics["loss"], jade)
+
+
+
+# now update config ONCE
+update_models_config(f"olivia-v{version}", out_dir)
+
+model = get_peft_model(model, peft_cfg)
+
+# --- Output directory versioning ---
+outdir, version = next_model_version("olivia")
+os.makedirs(outdir, exist_ok=True)
+
+# Load model + tokenizer
+tokenizer = AutoTokenizer.from_pretrained(BASE, token=HF_TOKEN)
+print(f"[INFO] Training Olivia version v{version} → {outdir}") 

@@ -6,6 +6,7 @@ import torch
 from torch.optim import Optimizer, AdamW
 from lion_pytorch import Lion
 from torch.optim.lr_scheduler import LambdaLR
+from transformers import TrainerCallback
 
 # TGDK scoring utilities
 from scoring import simulate_quantum_with_scorer
@@ -17,6 +18,114 @@ from accelerate.optimizer import AcceleratedOptimizer
 
 accelerator = Accelerator(mixed_precision="no")  # no AMP at all
 
+
+
+def get_trainable_params(model):
+    """
+    Collects only trainable parameters (e.g., LoRA adapters).
+    Falls back safely if none are found.
+    """
+    params = [p for n, p in model.named_parameters() if p.requires_grad]
+    if not params:
+        logging.warning("[Duo] No trainable parameters found — inserting dummy param.")
+        params = [torch.nn.Parameter(torch.zeros(1, requires_grad=True))]
+    return params
+
+# -----------------------------
+# Duo-bound Optimizer Factory
+# -----------------------------
+def make_duo_optimizer(model, mmt_controller=None, lr=2e-5, weight_decay=0.01, mode="hybrid"):
+    """
+    Factory for Duo optimizers.
+    mode = "symbolic" → TGDK Duo (Mahadevi/Maharaga/Trinity blending)
+    mode = "amp"      → DuoOptimizer (AMP + Collator + GhostGate)
+    mode = "hybrid"   → Wrap Duo inside DuoOptimizer for combined behavior
+    """
+    collator = ForkedCoalescingMatrixCollator()
+    ghost_gate = GhostGateAccelerator(mixed_precision="no")
+
+    if model is None:
+        logging.warning("[Duo] No model provided, returning Dummy optimizer.")
+        return DummyOptim([]), DummyScheduler()
+
+    # --- collect only trainable params (LoRA adapters, unfrozen layers, etc.) ---
+    trainable_params = [p for n, p in model.named_parameters() if p.requires_grad]
+    if not trainable_params:
+        logging.warning("[Duo] No trainable parameters found — inserting dummy param.")
+        trainable_params = [torch.nn.Parameter(torch.zeros(1, requires_grad=True))]
+    else:
+        logging.info(f"[Duo] Found {len(trainable_params)} trainable params.")
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                logging.debug(f"[Duo] Trainable → {n}: {tuple(p.shape)}")
+
+    # --- Symbolic Duo ---
+    symbolic_duo = Duo(
+        trainable_params,
+        lr=lr,
+        weight_decay=weight_decay,
+        mahadevi=getattr(mmt_controller, "mahadevi", None),
+        maharaga=getattr(mmt_controller, "maharaga", None),
+        trinity=getattr(mmt_controller, "trinity", None),
+    )
+
+    if mode == "symbolic":
+        sched = LambdaLR(symbolic_duo, lr_lambda=lambda step: 1.0)
+        logging.info("[Duo] Using symbolic Duo optimizer (Mahadevi/Maharaga/Trinity).")
+        return symbolic_duo, sched
+
+    # --- AMP/GhostGate Duo ---
+    amp_duo = DuoOptimizer(
+        trainable_params,
+        lr=lr,
+        weight_decay=weight_decay,
+        collator=collator,
+        mmt_controller=mmt_controller,
+    )
+    amp_duo = ghost_gate.inject(amp_duo)
+    amp_duo.ghost_gate = ghost_gate
+
+    if mode == "amp":
+        sched = LambdaLR(amp_duo, lr_lambda=lambda step: 1.0)
+        logging.info("[Duo] Using AMP/GhostGate DuoOptimizer.")
+        return amp_duo, sched
+
+    # --- Hybrid mode (wrap symbolic inside AMP) ---
+    class HybridDuo(torch.optim.Optimizer):
+        def __init__(self, symbolic, amp):
+            self.symbolic = symbolic
+            self.amp = amp
+            self.param_groups = amp.param_groups  # share param groups
+
+        def step(self, closure=None, grad_scaler=None):
+            loss = self.amp.step(closure=closure, grad_scaler=grad_scaler)
+            self.symbolic.step()
+            return loss
+
+        def zero_grad(self, set_to_none=False):
+            self.amp.zero_grad(set_to_none=set_to_none)
+
+        def state_dict(self):
+            return {"amp": self.amp.state_dict(), "symbolic": self.symbolic.state_dict()}
+
+        def load_state_dict(self, state_dict):
+            self.amp.load_state_dict(state_dict["amp"])
+            self.symbolic.load_state_dict(state_dict["symbolic"])
+
+    hybrid_duo = HybridDuo(symbolic_duo, amp_duo)
+    sched = LambdaLR(hybrid_duo, lr_lambda=lambda step: 1.0)
+
+    logging.info("[Duo] Using HYBRID Duo (AMP+GhostGate with symbolic blending).")
+    return hybrid_duo, sched
+
+
+class GhostGateCallback(TrainerCallback):
+    def __init__(self, ghost_gate):
+        self.ghost_gate = ghost_gate
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if hasattr(self.ghost_gate, "refresh_inf_state"):
+            self.ghost_gate.refresh_inf_state()
 
 
 # -----------------------------
@@ -205,33 +314,115 @@ class DuoOptimizer(Optimizer):
         return self.adamw.param_groups
 
 
+class Duo(torch.optim.Optimizer):
+    """
+    TGDK Duo Optimizer
+    - Blends AdamW and Lion updates with Mahadevi/Maharaga/Trinity balance factor.
+    - Now fully compatible with PyTorch schedulers (param_groups initialized).
+    """
 
+    def __init__(self, params, lr=1e-4, weight_decay=0.01,
+                 mahadevi=None, maharaga=None, trinity=None):
+        # --- filter trainable params (LoRA safe) ---
+        params = [p for p in params if getattr(p, "requires_grad", False)]
+        if not params:
+            logging.warning("[Duo] No trainable params found — inserting dummy param")
+            params = [torch.nn.Parameter(torch.zeros(1, requires_grad=True))]
 
+        defaults = dict(lr=lr, weight_decay=weight_decay)
+        super().__init__(params, defaults)   # <-- critical, sets param_groups ✅
 
-# -----------------------------
-# Duo-bound Optimizer Factory
-# -----------------------------
+        # sub-optimizers share the same param_groups
+        self.adamw = AdamW(self.param_groups, lr=lr, weight_decay=weight_decay)
+        self.lion  = Lion(self.param_groups, lr=lr, weight_decay=weight_decay)
 
-def make_duo_optimizer(model, mmt_controller=None, lr=2e-5, weight_decay=0.01):
-    collator = ForkedCoalescingMatrixCollator()
-    ghost_gate = GhostGateAccelerator(mixed_precision="no")
+        self.mahadevi = mahadevi
+        self.maharaga = maharaga
+        self.trinity  = trinity
 
-    if model is None:
-        logging.warning("[Duo] No model provided, returning Dummy optimizer.")
-        return DummyOptim([]), DummyScheduler()
+        self._step_count = 0
 
-    duo = DuoOptimizer(
-        model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-        collator=collator,
-        mmt_controller=mmt_controller,
-    )
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
 
-    sched = LambdaLR(duo, lr_lambda=lambda step: 1.0)
+        # --- AdamW update ---
+        adamw_before = {id(p): p.clone().detach()
+                        for g in self.param_groups
+                        for p in g['params'] if p.grad is not None}
+        self.adamw.step()
+        adamw_update = {pid: (p.detach() - adamw_before[pid])
+                        for g in self.param_groups
+                        for p in g['params'] if p.grad is not None
+                        for pid in [id(p)]}
 
-    logging.info("[Duo] DuoOptimizer initialized with AdamW+Lion+GhostGate+MMT.")
-    return duo, sched
+        # --- Lion update ---
+        lion_before = {id(p): p.clone().detach()
+                       for g in self.param_groups
+                       for p in g['params'] if p.grad is not None}
+        self.lion.step()
+        lion_update = {pid: (p.detach() - lion_before[pid])
+                       for g in self.param_groups
+                       for p in g['params'] if p.grad is not None
+                       for pid in [id(p)]}
+
+        # --- Blend ---
+        alpha = self.compute_balance_factor()
+        for g in self.param_groups:
+            for p in g['params']:
+                if p.grad is None:
+                    continue
+                pid = id(p)
+                blended = alpha * adamw_update[pid] + (1 - alpha) * lion_update[pid]
+                p.data = lion_before[pid] + blended
+
+        self._step_count += 1
+        return loss
+
+    def zero_grad(self, set_to_none: bool = False):
+        for g in self.param_groups:
+            for p in g['params']:
+                if p.grad is not None:
+                    if set_to_none:
+                        p.grad = None
+                    else:
+                        p.grad.detach_()
+                        p.grad.zero_()
+
+    def state_dict(self):
+        return {
+            "adamw": self.adamw.state_dict(),
+            "lion": self.lion.state_dict(),
+            "_step_count": self._step_count,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.adamw.load_state_dict(state_dict["adamw"])
+        self.lion.load_state_dict(state_dict["lion"])
+        self._step_count = state_dict.get("_step_count", 0)
+
+    def compute_balance_factor(self, epoch=None, loss=None):
+        alpha = 0.5
+        if self.mahadevi and self.maharaga and self.trinity:
+            try:
+                v1 = np.array(self.mahadevi.vector_field[0])
+                v2 = np.array(self.mahadevi.vector_field[1])
+                angle = self.mahadevi.angle_between_vectors(v1, v2) / 180.0
+                centroid = (np.mean(self.maharaga.data_points, axis=0)
+                            if self.maharaga.data_points else np.array([0.5]))
+                centroid_norm = np.linalg.norm(centroid) % 1.0
+                trinity_seq = np.mean(self.trinity.expand_data(np.random.rand(5)))
+                alpha = float((angle + centroid_norm + trinity_seq) / 3.0)
+                if epoch is not None:
+                    alpha *= (1 - epoch * 0.05)
+                if loss is not None:
+                    alpha *= (1.0 / (1.0 + loss))
+                return max(0.0, min(1.0, alpha))
+            except Exception:
+                return 0.5
+        return alpha
 
 
 # -----------------------------
@@ -254,7 +445,7 @@ class ForkedCoalescingMatrixCollator:
             except Exception as e:
                 logging.warning(f"[Collator] Duoqiadratilization failed: {e}")
 
-
+    
 # -----------------------------
 # Dummy Fallbacks
 # -----------------------------
